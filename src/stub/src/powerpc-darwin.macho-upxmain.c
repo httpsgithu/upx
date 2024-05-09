@@ -2,9 +2,9 @@
 
    This file is part of the UPX executable compressor.
 
-   Copyright (C) 1996-2020 Markus Franz Xaver Johannes Oberhumer
-   Copyright (C) 1996-2020 Laszlo Molnar
-   Copyright (C) 2000-2020 John F. Reiser
+   Copyright (C) 1996-2024 Markus Franz Xaver Johannes Oberhumer
+   Copyright (C) 1996-2024 Laszlo Molnar
+   Copyright (C) 2000-2024 John F. Reiser
    All Rights Reserved.
 
    UPX and the UCL library are free software; you can redistribute them
@@ -733,7 +733,7 @@ main(int argc, char *argv[])
             break;
         }
     }
-    char mhdr[16384];
+    char mhdr[32768];
     uint32_t entry = upx_main((struct l_info const *)payload, paysize,
         (Mach_header *)mhdr, sizeof(mhdr),
         f_exp, f_unf, (Mach_header **)&argv[-2]);

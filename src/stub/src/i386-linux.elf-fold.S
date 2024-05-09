@@ -3,7 +3,7 @@
 ;
 ;  This file is part of the UPX executable compressor.
 ;
-;  Copyright (C) 2000-2020 John F. Reiser
+;  Copyright (C) 2000-2024 John F. Reiser
 ;  All Rights Reserved.
 ;
 ;  UPX and the UCL library are free software; you can redistribute them
@@ -30,18 +30,21 @@
 */
 
 #include "arch/i386/macros.S"
+NBPW= 4
 
 
 PAGE_SIZE= ( 1<<12)
 PATH_MAX= 4096
 
 ET_DYN= 3
-#define szElf32_Ehdr 0x34
-#define szElf32_Phdr 8*4
-e_type=   16
-e_phnum=  44
-#define e_entry  (16 + 2*2 + 4)
-#define p_memsz  5*4
+ET_EXEC= 2
+sz_Elf32_Ehdr= 0x34
+  e_type=   16
+  e_entry=  (16 + 2*2 + 4)
+  e_phnum=  44
+sz_Elf32_Phdr= 8*4
+  p_memsz=  5*4
+
 #define szb_info 12
 #define szl_info 12
 #define szp_info 12
@@ -54,6 +57,8 @@ __NR_munmap=   91
 __NR_open= 5
 __NR_close= 6
 __NR_mmap= 0xc0
+__NR_mprotect= 0x7d
+__NR_brk= 45
 
 MAP_PRIVATE=   0x02
 MAP_FIXED=     0x10
@@ -66,9 +71,9 @@ O_RDONLY=       0
 // are uncompressed.
 
 // enter:
-// eax:ADRX; ebx:free; ecx:LENX; edx:&unfold
+// eax:ADRX; ebx:free; ecx:LENX
 // ebp:f_exp; esi:free; edi:elfaddr
-// esp/ ADRU,LENU,fd,entry,argc,argv,0,envp,0,auxv,0,strings
+// esp/ ADRU,LENU,fd,%entry,argc,argv,0,envp,0,auxv,0,strings
 //      (ADRU,LENU) = params for final munmap()
 //      (ADRX,LENX) = extent of compressed program (after moving)
 
@@ -159,8 +164,8 @@ F_fd= 6*4  // frame offset to fd
         pop esi  // LENX: total_size
         pop ecx  // elfaddr
 #define OVERHEAD 2048
-#define MAX_ELF_HDR 512
-        sub esp, MAX_ELF_HDR + OVERHEAD  // alloca
+#include "MAX_ELF_HDR.S"
+        sub esp, MAX_ELF_HDR_32 + OVERHEAD  // alloca
         mov edx, esp  // &tmp
         push ecx  // elfaddr (9th arg)
         mov ebx, [   eax]  // length of uncompressed ELF headers
@@ -172,12 +177,21 @@ F_fd= 6*4  // frame offset to fd
 .extern upx_main
         call upx_main  // returns entry address
         dec edi
+        mov esi,eax  // entry
+        mov ebp,[8*4+ esp]  // elfaddr
+
+// Discard C_TEXT (includes [ADRC,+LENC) )
+        mov ecx,[ebp+ p_memsz+sz_Elf32_Phdr+sz_Elf32_Ehdr]  // Phdr[C_TEXT= 1].p_memsz
+        mov ebx,ebp  // hi &Elf32_Ehdr
+        cmpw [e_type + ebp],ET_EXEC; jne 1f
+          push __NR_brk; pop %eax; int 0x80  // static __end_bss
+1:
+        push __NR_munmap; pop %eax; int 0x80  // discard C_TEXT compressed data
 
 // Buggy programs may depend on uninit stack being 0, so clear what we used.
-        mov esi,eax  // save entry
         mov edx,edi  // save auxv
         mov edi,esp
-        mov ecx,((8 +1)*4 + MAX_ELF_HDR + OVERHEAD) >>2  // 8 params, elfaddr, un-alloca
+        mov ecx,((8 +1)*4 + MAX_ELF_HDR_32 + OVERHEAD) >>2  // 8 params, elfaddr, un-alloca
         xor eax,eax  // 0
         rep stosd  // clear frame on exit
         mov esp,edi  // end of frame
@@ -185,13 +199,17 @@ F_fd= 6*4  // frame offset to fd
         pop eax  // ADRU
         pop ecx  // LENU
         pop edi  // fd
-        pop ebx  // space
+        pop ebx  // %entry
         push esi  // entry
         push ecx  // LENU
         push eax  // ADRU
         push edx  // auxv
         push edi  // fd, auxv, ADRU, LENU, entry, argc
 
+// Map one page of /proc/self/exe so that symlink does not disappear
+        pop ebx  // fd in case no_pse_map
+        test edi,edi; js no_pse_map
+        push ebx  // restore fd
         sub ebp,ebp  // 0 block in file
         // edi has fd
         push MAP_PRIVATE; pop esi
@@ -202,7 +220,7 @@ F_fd= 6*4  // frame offset to fd
 
         pop ebx  // fd;  auxv, LENU, ADRU, entry, argc
         push __NR_close; pop eax; int 0x80
-
+no_pse_map:
         pop edi  // auxv table
         sub eax,eax  // 0, also AT_NULL
         .byte 0x3c  // "cmpb al, byte ..." like "jmp 1+L60" but 1 byte shorter
@@ -211,7 +229,8 @@ L60:
         scasd  // a_type
         jne L60  // not AT_NULL
 // edi now points at [AT_NULL]a_un.a_ptr which contains result of make_hatch()
-        pop ebx  // ADRU
+
+        pop ebx  // ADRU  parameters for final munmap
         pop ecx  // LENU
 
         push eax
@@ -225,6 +244,19 @@ L60:
 
         mov al, __NR_munmap  // eax was 0 from L60
         jmp [edi]  // unmap ourselves via escape hatch, then goto entry
+
+// Sometimes linux enforces page-aligned address
+Pprotect: .globl Pprotect
+    xchg ebx,[1*NBPW + esp]  // save reg, %ebx= address
+    mov ecx,ebx  // copy address
+    and ebx, ~0<<12  // page align
+    sub ecx,%ebx  // extra length
+    add ecx,[2*NBPW + esp]  // length
+    mov edx,[3*NBPW + esp]  // bits
+    push __NR_mprotect; pop %eax; int 0x80
+    cmp eax, -0x1000; jna 0f; hlt; 0:
+    mov ebx,[1*NBPW + esp]  // restore reg
+    ret
 
 mmap: .globl mmap  // what happened to the ebx->args_on_stack method?
         push ebp

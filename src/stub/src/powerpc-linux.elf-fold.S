@@ -2,9 +2,9 @@
 *
 *  This file is part of the UPX executable compressor.
 *
-*  Copyright (C) 1996-2020 Markus Franz Xaver Johannes Oberhumer
-*  Copyright (C) 1996-2020 Laszlo Molnar
-*  Copyright (C) 2000-2020 John F. Reiser
+*  Copyright (C) 1996-2024 Markus Franz Xaver Johannes Oberhumer
+*  Copyright (C) 1996-2024 Laszlo Molnar
+*  Copyright (C) 2000-2024 John F. Reiser
 *  All Rights Reserved.
 *
 *  UPX and the UCL library are free software; you can redistribute them
@@ -35,9 +35,6 @@ NBPW= 4  // Number of Bytes Per Word
 
 PATH_MAX= 4096  // /usr/include/linux/limits.h
 
-szElf32_Ehdr= 0x34
-szElf32_Phdr= 0x20
-e_phnum= 44
 AT_NULL= 0
 
 sz_b_info= 12
@@ -78,11 +75,18 @@ av_len=  20
 cblk=    19
 r_buf=   18
 
+page_mask:
+        .int -0x1000  // default page mask (4KiB)
+        .balign 4
 get_page_mask: .globl get_page_mask
-        li r3,0 -0x1000>>9  // modified by elf-entry.S
-        slwi r3,r3,9
+        mflr t1  // retaddr
+        call L60  // for PC-relative addressing
+L60:
+        mflr r3  // L60
+        mtlr t1  // original retaddr
+        lwz r3,page_mask - L60(r3)
         blr
-        nop
+        nop  // pad to known 8-word block
 
 fold_begin:
         call L90
@@ -116,6 +120,10 @@ L90:
         la cblk,NBPW(a1)  // original &strings
         stwu r0,NBPW(a0)
         la  r_buf,L_PFX(a0)  // buffer
+// r_fd = open("/proc/self/exe", O_RDONLY)
+        li a1,O_RDONLY
+        la a0,L_PFX+ L90a - L90b(r_unf)  //     "/proc/self/exe"
+        call open; mr r_fd,a0
 // readlink("/proc/self/exe", buffer, -1+ PATH_MAX)
         li a2,-1+ PATH_MAX
         movr a1,r_buf  // buffer
@@ -165,9 +173,24 @@ L90:
         la  sp,SZ_FRAME+OVERHEAD(sp)  // deallocate this frame
         mr r_exp,a0  // save &entry
 
+sz_Ehdr= 13*NBPW
+e_type= 16
+ET_EXEC= 2
+sz_Phdr= 8*NBPW
+p_vaddr= 2*NBPW
+p_memsz= 5*NBPW
+// Discard pages of compressed data (includes [ADRX,+LENX) )
+        lwz a1,p_memsz+sz_Phdr+sz_Ehdr(r_elf)  // Phdr[C_TEXT= 1].p_memsz
+        //lhz r0,e_type(r_elf); cmpwi r0,ET_EXEC; bne 1f  // only ET_EXEC
+        movr a0,r_elf; call brk  // also set the brk
+1:
+        lwz a1,p_memsz+sz_Phdr+sz_Ehdr(r_elf)  // Phdr[C_TEXT= 1].p_memsz
+        movr a0,r_elf; call munmap  # discard C_TEXT compressed data
+
 // first page of /proc/self/exe, to preserve it despite munmap(ADRU, LENU)
         li a5,0  // offset
         movr a4,r_fd
+        cmpwi a4,0; blt no_map_pse
         li a3,MAP_PRIVATE
         li a2,PROT_READ
         neg a1,r_PMASK  // PAGE_SIZE
@@ -176,6 +199,7 @@ L90:
 // close /proc/self/exe
         movr a0,r_fd
         call close
+no_map_pse:
 
 AT_NULL= 0  // <elf.h>
 a_type= 0
@@ -211,6 +235,13 @@ SYS_readlink=  85
 SYS_mmap=      90
 SYS_munmap=    91
 SYS_mprotect= 125
+
+Pprotect: .globl Pprotect
+        li r0, 0xfff  // ~PAGE_MASK  (FIXME: probably use 4th arg)
+        and r0,a0,r0
+        sub a0,a0,r0
+        add a1,a1,r0
+        b mprotect
 
 mmap: .globl mmap
         li r0,SYS_mmap

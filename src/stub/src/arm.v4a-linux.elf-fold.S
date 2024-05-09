@@ -2,7 +2,7 @@
 @
 @  This file is part of the UPX executable compressor.
 @
-@  Copyright (C) 2000-2020 John F. Reiser
+@  Copyright (C) 2000-2024 John F. Reiser
 @  All Rights Reserved.
 @
 @  UPX and the UCL library are free software; you can redistribute them
@@ -27,12 +27,18 @@
 @  <jreiser@users.sourceforge.net>
 @
 
+NBPW= 4
+
 #define ARM_OLDABI 1
 #include "arch/arm/v4a/macros.S"
 #define bkpt .long 0xe7f001f0  /* reserved instr; Linux GNU eabi breakpoint */
 
-sz_Elf32_Ehdr = 13*4
-sz_Elf32_Phdr =  8*4
+sz_Elf32_Ehdr = 13*NBPW
+e_type= 16
+ET_EXEC= 2
+sz_Elf32_Phdr =  8*NBPW
+p_vaddr= 2*NBPW
+p_memsz= 5*NBPW
 sz_l_info = 12
 sz_p_info = 12
 sz_b_info = 12
@@ -60,7 +66,8 @@ PATH_MAX= 4096
 #endif  /*}*/
 
 #define OVERHEAD 2048
-#define MAX_ELF_HDR 512
+#define call bl
+#include "MAX_ELF_HDR.S"
 
 mflg_data: .int MAP_PRIVATE|MAP_ANONYMOUS  @ overwritten for QNX vs Linux
 
@@ -69,9 +76,9 @@ SP_fd= 3*4
    r4= LENX
    r5= ADRX
    lr= "/proc/self/exe"
-new sp/            elfaddr,fd, ADRU,LENU, f_exp,%entry, argc,argv,0,envp,0,auxv
-        (ADRX,LENX) = extent of compressed program (after moving)
-        (ADRU,LENU) = params for final munmap()
+new sp/            elfaddr,fd, ADRU,LENU, f_exp,%entry, r0,r1, argc,argv,0,envp,0,auxv
+        (ADRX,LENX) = extent of compressed program
+        (ADRU,LENU) = params to munmap unfolded stub
 */
 fold_begin:  // enter here
 #if DEBUG  //{
@@ -79,20 +86,24 @@ fold_begin:  // enter here
         mov r0,sp  @ current stack pointer (extra clue)
         stmdb sp!,{TRACE_REGS}; mov r0,#0x10; bl trace
 #endif  //}
-        ldmia sp!,{      r6,r7,r8,r9,r10,r11,r12}  @ r12= argc
+        mov r2,r4  @ LENX
+        mov r3,r5  @ ADRX
+        ldmia sp!,{      r4,r5,r6,r7,r8,r9,r10,r11,r12}  @ r12= argc
         mov r1,sp  @ src (argv)
         sub sp,sp,#PATH_MAX
         mov r0,sp  @ dst
-        stmdb sp!,{r4,r5,r6,r7,r8,r9,r10,r11,r12}  @ r12= argc
-F_LENX=    0*4
-F_ADRX=    1*4
-F_elfaddr= 2*4
-F_fd=      3*4
-F_ADRU=    4*4
-F_LENU=    5*4
-F_f_exp=   6*4
+        stmdb sp!,{r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12}  @ r12= argc
+F_LENX=    0*NBPW
+F_ADRX=    1*NBPW
+F_elfaddr= 2*NBPW
+F_fd=      3*NBPW
+F_ADRU=    4*NBPW
+F_LENU=    5*NBPW
+F_f_exp=   6*NBPW
   F_e_auxv=  F_f_exp
-F_entry=   7*4
+F_entry=   7*NBPW
+F_r0=      8*NBPW
+F_r1=      9*NBPW
 
 0: // copy argv down
         ldr r3,[r1],#4; cmp r3,#0
@@ -115,7 +126,7 @@ F_entry=   7*4
         mov r1,r0  @ buffer
         mov r0,lr  @ arg1= "/proc/self/exe"
         sub r2,r2,#1  @ room for null terminator
-        bl readlink
+        call readlink
         cmn r0,#4096
         movcs r1,lr  @ "/proc/self/exe"
         movcs r0,#14  @ strlen("/proc/self/exe")
@@ -158,8 +169,8 @@ link_ok:
 /* Construct arglist for upx_main */
         @ldr r5,[sp,#F_f_exp]
         ldmia sp!,{r4,r10,r11}  @ LENX, ADRX, elfaddr
-F_delta= 3*4
-        sub sp,sp,#MAX_ELF_HDR + OVERHEAD  @ alloca
+F_delta= 3*NBPW
+        sub sp,sp,#MAX_ELF_HDR_32 + OVERHEAD  @ alloca
         ldr r9,[r10,#sz_cpr]  @ xi.size  of ELF headers
         mov r8,sp  @ xo.ptr
         ldr r7,[r10,#sz_unc]  @ xo.size
@@ -174,26 +185,34 @@ F_delta= 3*4
 #endif  //}
 // r0=av; r1=sz_cpr; r2=f_decompress; r3=f_unfilter;
 // xo={sz_unc, &tmp_ehdr}, xi={sz_cpr, &b_info}, elfaddr
-        bl upx_main
+        call upx_main
         add sp,sp,#(9-4)*4
-        add sp,sp,#MAX_ELF_HDR + OVERHEAD  @ un-alloca
+        add sp,sp,#MAX_ELF_HDR_32 + OVERHEAD  @ un-alloca
 #if DEBUG  //{
         stmdb sp!,{TRACE_REGS}; mov r0,#0x14; bl trace
 #endif  //}
         str r0,[sp,#F_entry - F_delta]  @ entry address
 
+// Discard pages of compressed input data (includes [ADRC,+LENC) )
+        ldr r1,[r11,#p_memsz+sz_Elf32_Phdr+sz_Elf32_Ehdr]  // Phdr[C_TEXT= 1].p_memsz
+        //ldrb r0,[r11,#e_type]; cmp r0,#ET_EXEC; bne 1f
+        mov r0,r11; call brk  // also sets the brk
+1:
+        mov r0,r11; call munmap  // discard C_TEXT compressed data
+
 // Map 1 page of /proc/self/exe so that it does not disappear
         ldr r4,[sp],#4  @ pop r4,F_fd
+        cmp r4,#0; blt no_map_pse
         mov r5,#0  @ SEEK_SET offset
         stmdb sp!,{r4,r5}  @ arg5,arg6 calling convention
         mov r3,#MAP_PRIVATE
         mov r2,#PROT_READ
         mov r1,#PAGE_SIZE
         mov r0,#0  @ any address
-        bl mmap  @ no error check: cannot recover
+        call mmap  @ no error check: cannot recover
         ldmia sp!,{r0,r1}  @ fd, offset
-        bl close
-
+        call close
+no_map_pse:
 #if DEBUG  //{
         stmdb sp!,{TRACE_REGS}; mov r0,#0x15; bl trace
 #endif  //}
@@ -201,9 +220,9 @@ F_delta= 3*4
         // crumb is unused: replaced by mapping /proc/self/exe into a free page
 
 #if DEBUG  /*{*/
-        ldr r3,[r2,#4 -2*4]  @ Elf32_auxv_t[AT_NULL@.a_type].a_val
+        ldr r3,[r2,#NBPW -2*NBPW]  @ Elf32_auxv_t[AT_NULL@.a_type].a_val
         ldr r4,[r3,#0]  @ 1st instr
-        ldr r5,[r3,#4]  @ 2nd instr
+        ldr r5,[r3,#NBPW]  @ 2nd instr
         stmdb sp!,{TRACE_REGS}; mov r0,#0x15; bl trace
 #endif  /*}*/
         mov r3,#0  @ clear registers: paranoia
@@ -222,7 +241,7 @@ F_delta= 3*4
 sweep:
         ldr r7,[sp],#-(1<<5)  @ extend stack; read allocate 32 bytes
         str r7,[sp]  @ make it dirty
-        ldr r7,[sp]  @ read alocate again in case dirtying caused COW split
+        ldr r7,[sp]  @ read allocate again in case dirtying caused COW split
         cmp r12,sp; blo sweep
 
         add sp,sp,#(1<<18)  @ pop stack
@@ -238,7 +257,7 @@ sweep:
         mov r7,#0
         mov r12,#0
 #endif  /*}*/
-        ldr pc,[r2,#4 -2*4]  @ Elf32_auxv_t[AT_NULL@.a_type].a_val
+        ldr pc,[r2,#NBPW -2*NBPW]  @ hatch: Elf32_auxv_t[AT_NULL@.a_type].a_val
 
 proc_self_exe:
         .ascii "/proc/self/exe"  @ no terminator
@@ -357,7 +376,7 @@ __ARM_NR_cacheflush = 2 + __ARM_NR_BASE
 
         .globl my_bkpt
 my_bkpt:
-        bkpt
+        bkpt  // my_bkpt
         ret
 
         .globl exit
@@ -400,14 +419,14 @@ readlink:
 munmap:
         do_sys __NR_munmap; ret
 
-        .globl mprotect
-mprotect:
+// Sometimes Linux enforces page-aligned address
+Pprotect: .globl Pprotect
+mprotect: .globl mprotect
+        ldr r12,m_off4k
+        and r12,r12,r0  // lo frag
+        sub r0,r0,r12  // page align lo end
+        add r1,r1,r12
         do_sys __NR_mprotect; ret
-
-        .globl __clear_cache
-__clear_cache:
-        mov r2,#0
-        do_sys2 __ARM_NR_cacheflush; ret
 
         .globl mmap
 mmap:
@@ -416,8 +435,23 @@ mmap:
         ldr r4,[sp,#3*4]
         mov r5,r5,lsr #12  @ convert to page number
 mmap_do:
+        ldr r12,m_off4k
+        and r12,r12,r0  // lo frag
+        sub r0,r0,r12  // page align lo end
+        add r1,r1,r12
         do_sys __NR_mmap2
         ldmia sp!,{r4,r5,pc}
+
+m_off4k:
+        .word -1+ (1<<PAGE_SHIFT)  // offset mask for 4KiB
+
+        do_sys __NR_mmap2
+        ldmia sp!,{r4,r5,pc}
+
+        .globl __clear_cache
+__clear_cache:
+        mov r2,#0
+        do_sys2 __ARM_NR_cacheflush; ret
 
 get_sys_munmap: .globl get_sys_munmap  // r0= system call instruction
 #if defined(ARMEL_DARWIN)  /*{*/
@@ -441,6 +475,7 @@ mmap_privanon: .globl mmap_privanon
 
 #if 1|DEBUG  /*{*/
 
+__udivsi3: .globl __udivsi3
 div10: .globl div10
         mov ip,r0  @ extra copy used at end
         sub r1,r1,r1  @ hi

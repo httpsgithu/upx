@@ -2,9 +2,9 @@
 *
 *  This file is part of the UPX executable compressor.
 *
-*  Copyright (C) 1996-2020 Markus Franz Xaver Johannes Oberhumer
-*  Copyright (C) 1996-2020 Laszlo Molnar
-*  Copyright (C) 2000-2020 John F. Reiser
+*  Copyright (C) 1996-2024 Markus Franz Xaver Johannes Oberhumer
+*  Copyright (C) 1996-2024 Laszlo Molnar
+*  Copyright (C) 2000-2024 John F. Reiser
 *  All Rights Reserved.
 *
 *  UPX and the UCL library are free software; you can redistribute them
@@ -92,6 +92,7 @@ decompress:  // (uchar const *src, size_t lsrc, uchar *dst, u32 &ldst, uint meth
         push ldst
         push dst
         addq src,lsrc; push lsrc  // &input_eof
+        subq src,lsrc  // restore the value of lsrc
 
   section NRV_HEAD
 
@@ -100,13 +101,14 @@ decompress:  // (uchar const *src, size_t lsrc, uchar *dst, u32 &ldst, uint meth
 #define len  %ecx  /* XXX: 2GB */
 #define lenq %rcx
 #define bits %ebx
-#define disp %rbp
+#define displ %ebp
+#define dispq %rbp
 
         movq src,%rsi  // hardware src for movsb, lodsb
         movq dst,%rdi  // hardware dst for movsb
         xor bits,bits  // empty; force refill
         xor len,len  // create loop invariant
-        orq $(~0),disp  // -1: initial displacement
+        orq $(~0),dispq  // -1: initial displacement
         call setup  // push &getbit [TUNED]
 ra_setup:
 
@@ -153,10 +155,10 @@ refill:
         movb (%rsi),%dl  // speculate: literal, or bottom 8 bits of offset
         rep; ret
 
-copy:  // In: len, %rdi, disp;  Out: 0==len, %rdi, disp;  trashes %rax, %rdx
-        leaq (%rdi,disp),%rax; cmpl $5,len  // <=3 is forced
+copy:  // In: len, %rdi, dispq;  Out: 0==len, %rdi, dispq;  trashes %rax, %rdx
+        leaq (%rdi,dispq),%rax; cmpl $5,len  // <=3 is forced
         movb (%rax),%dl; jbe copy1  // <=5 for better branch predict
-        cmpq $-4,disp;   ja  copy1  // 4-byte chunks would overlap
+        cmpq $-4,dispq;   ja  copy1  // 4-byte chunks would overlap
         subl $4,len  // adjust for termination cases
 copy4:
         movl (%rax),%edx; addq $4,      %rax; subl $4,len
@@ -209,14 +211,6 @@ msg_SELinux:
 L70:
         .asciz "PROT_EXEC|PROT_WRITE failed.\n"
 L71:
-
-        // IDENTSTR goes here
-
-  section ELFMAINZ
-msg_proc_self_exe:
-        push $14; pop %arg3  // length
-        push %arg1; pop %arg2  // "/proc/self/exe"
-        jmp L75
 L72:
         pop %arg2  // message text
 L75:
@@ -228,32 +222,34 @@ die:
         push $ __NR_exit; pop %rax
         syscall
 
+        // IDENTSTR goes here
+
+  section ELFMAINZ
 // Decompress the rest of this loader, and jump to it.
 unfold:  // IN: rbp= &f_exp; rsp/ &proc_self_exe,%entry
         pop %arg1  // &proc_self_exe
         sub %arg2l,%arg2l  // O_RDONLY
-        push $__NR_open; pop %rax
-        syscall; test %eax,%eax; js msg_proc_self_exe
+        push $__NR_open; pop %rax; syscall
+        // test %eax,%eax; js msg_proc_self_exe  // no longer fatal
         push %rax  // save fd
 
         lea -4+ FOLD - proc_self_exe(%arg1),%rsi  // &O_BINFO | is_ptinterp
         lodsl; and $~1,%eax; movl %eax,%r14d  // O_BINFO
         push %rsi; pop %rbx  // &b_info of folded decompressor
-        lodsl; xchg %eax,%edx;         add %rbx,%rdx  // .sz_unc; last of unfolded
-        lodsl; xchg %eax,%r13d; lodsl; add %rsi,%r13  // .sz_cpr; last of   folded
+        movl (%rsi),%edx  // .sz_unc
 
         lea sz_pack2 - f_exp(%rbp),%rcx  // &sz_pack2
         movl (%rcx),%r15d  // sz_pack2: length before stub
         subq %r15,%rcx  // elfaddr= &Elf64_Ehdr of this stub
         subl %r14d,%r15d  // LENX= sz_pack2 - O_BINFO
+        addq %rcx,%r14  // ADRX= elfaddr + O_BINFO
           pop %rdi  // fd
-        subq %rcx,%rdx; push %rdx  // LENU
+        push %rdx  // LENU
         push %rax  // %ADRU
-        subq %rcx,%r13  // LENF
           push %rdi  // fd
         push %rcx  // elfaddr
 
-// Reserve space for input file and unfolded stub.
+// Reserve space for unfolded stub.
         subq %arg6,%arg6  // 0 offset
         orl $-1,%arg5l  // fd
         push $MAP_PRIVATE|MAP_ANONYMOUS; pop %sys4
@@ -261,44 +257,23 @@ unfold:  // IN: rbp= &f_exp; rsp/ &proc_self_exe,%entry
         push $PROT_READ|PROT_WRITE; pop %arg3
         subl %arg1l,%arg1l  // 0; kernel chooses addr
         push $__NR_mmap; pop %rax; syscall
-        addq %rax,%r14  // + O_BINFO = ADRX
         movq %rax,2*8(%rsp)  // ADRU
 
-// Duplicate the input data.
-        xchgq %rax,%arg1  // same address
-        //subq %arg6,%arg6  // 0 offset
-        movl 1*8(%rsp),%arg5l  // fd
-        push $MAP_PRIVATE|MAP_FIXED; pop %sys4
-        //push $PROT_READ|PROT_WRITE; pop %arg3
-        movq %r13,%arg2  // len
-        push $__NR_mmap; pop %rax; syscall
-
-// Remember new f_exp region for PROT_EXEC.
-        movq 3*8(%rsp),%rdx  // LENU
-        pop %rcx; push %rcx  // elfaddr
-        addq %rax,%rdx  // new last of unfoded
-        subq %rcx,%rax  // new - old
-        movq %rax,%r12  // relocation constant
-        addq %rbp,%rax; push %rax  // P_10  new f_exp
-        andq $PAGE_MASK,%rax; push %rax  // P_11  address
-        subq %rax,%rdx; push %rdx  // P_12  length
-
 // Unfold
-        movq %rbx,%rsi
+        push %rax; pop %arg3  // dst= new unfold
+        push %rbx; pop %rsi
         lodsl; push %rax; movq %rsp,%arg4  // P_13  .sz_unc; &dstlen
-        lea (%rbx,%r12),%arg3  // dst= new unfold
         movq %arg3,%r13  // execute here
         lodsl; push %rax  // P_14  tmp= .sz_cpr
         lodsl; xchg %eax,%arg5l  // .b_method
         movq %rsi,%arg1  // src
         pop %arg2  // P_14  srclen
-        call *%rbp  // old f_exp
+        call *%rbp  // f_exp
         pop %rcx  // P_13  toss .sz_unc
 
 // PROT_EXEC
-        pop %arg2  // P_12  length
-        pop %arg1  // P_11  addr
-        pop %rbp   // P_10  new f_exp
+        movq 3*8(%rsp),%arg2  // LENU
+        movq 2*8(%rsp),%arg1  // ADRU
         push $PROT_READ|PROT_EXEC; pop %arg3
         push $__NR_mprotect; pop %rax; syscall
 

@@ -2,9 +2,9 @@
 *
 *  This file is part of the UPX executable compressor.
 *
-*  Copyright (C) 1996-2020 Markus Franz Xaver Johannes Oberhumer
-*  Copyright (C) 1996-2020 Laszlo Molnar
-*  Copyright (C) 2000-2020 John F. Reiser
+*  Copyright (C) 1996-2024 Markus Franz Xaver Johannes Oberhumer
+*  Copyright (C) 1996-2024 Laszlo Molnar
+*  Copyright (C) 2000-2024 John F. Reiser
 *  All Rights Reserved.
 *
 *  UPX and the UCL library are free software; you can redistribute them
@@ -139,6 +139,10 @@ L90:
         la cblk,NBPW(a1)  // original &strings
         stwu r0,NBPW(a0)
         la  r_buf,L_PFX(a0)  // buffer
+// r_fd = open("/proc/self/exe", O_RDONLY)
+        li a1,O_RDONLY
+        la a0,L_PFX+ L90a - L90b(r_unf)  //     "/proc/self/exe"
+        call open; mr r_fd,a0
 // readlink("/proc/self/exe", buffer, -1+ PATH_MAX)
         li a2,-1+ PATH_MAX
         movr a1,r_buf  // buffer
@@ -216,9 +220,18 @@ noTOC:
 #endif  //}
         mr r_exp,a0  // save &entry (.entry when BIG_ENDIAN)
 
+p_memsz= 4+4+ 4*NBPW
+// Discard pages of compressed data (includes [ADRX,+LENX) )
+        ld a1,p_memsz+szElf64_Phdr+szElf64_Ehdr(r_elfa)  // Phdr[C_TEXT= 1].p_memsz
+        //lhz r0,e_type(r_elf); cmpwi r0,ET_EXEC; bne 1f  // only ET_EXEC
+        movr a0,r_elfa; call brk  // also set the brk
+1:
+        movr a0,r_elfa; call munmap  # discard C_TEXT compressed data
+
 // first page of /proc/self/exe, to preserve it despite munmap(ADRU, LENU)
         li a5,0  // offset
         movr a4,r_fd
+        cmpwi a4,0; blt no_map_pse
         li a3,MAP_PRIVATE
         li a2,PROT_READ
         neg a1,r_PMASK  // PAGE_SIZE
@@ -227,6 +240,7 @@ noTOC:
 // close /proc/self/exe
         movr a0,r_fd
         call close
+no_map_pse:
 
 AT_NULL= 0  // <elf.h>
 a_type= 0
@@ -303,6 +317,14 @@ sysgo:
 no_fail:
         ret
 
+Pprotect: .globl Pprotect
+mprotect: .globl mprotect
+        li r0, 0xfff  // ~PAGE_MASK  (FIXME: probably use 4th arg)
+        and r0,a0,r0
+        sub a0,a0,r0
+        add a1,a1,r0
+        li r0,SYS_mprotect; 5: b 5f
+
 exit: .globl exit
         li r0,SYS_exit;        b 5f
 brk: .globl brk
@@ -317,13 +339,11 @@ open: .globl open
         li r0,SYS_open;     5: b 5f
 close: .globl close
         li r0,SYS_close;    5: b 5f
-mprotect: .globl mprotect
-        li r0,SYS_mprotect; 5: b 5f
 munmap: .globl munmap
         li r0,SYS_munmap;   5: b sysgo
 
 my_bkpt: .globl my_bkpt
-        teq r0,r0
+        teq r0,r0  // my_bkpt
         blr
 
 /* vim:set ts=8 sw=8 et: */

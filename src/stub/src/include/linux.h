@@ -2,8 +2,8 @@
 
    This file is part of the UPX executable compressor.
 
-   Copyright (C) 1996-2020 Markus Franz Xaver Johannes Oberhumer
-   Copyright (C) 1996-2020 Laszlo Molnar
+   Copyright (C) 1996-2024 Markus Franz Xaver Johannes Oberhumer
+   Copyright (C) 1996-2024 Laszlo Molnar
    All Rights Reserved.
 
    UPX and the UCL library are free software; you can redistribute them
@@ -184,6 +184,7 @@ struct timespec {
 #define __NR_adjtimex           124
 #define __NR_mprotect           125
 #define __NR_nanosleep          162
+#define __NR_memfd_create       356  /*0x164*/
 
 #undef _syscall0
 #undef _syscall1
@@ -353,6 +354,7 @@ static inline _syscall2(int,ftruncate,int,fd,size_t,len)
 static inline _syscall0(pid_t,getpid)
 static inline _syscall2(int,gettimeofday,struct timeval *,tv,void *,tz)
 static inline _syscall3(off_t,lseek,int,fd,off_t,offset,int,whence)
+static inline _syscall2(int,memfd_create,char const *,name,unsigned,flags);
 static inline _syscall3(int,mprotect,void *,addr,size_t,len,int,prot)
 static inline _syscall2(int,munmap,void *,start,size_t,length)
 static inline _syscall2(int,nanosleep,const struct timespec *,rqtp,struct timespec *,rmtp)
@@ -403,12 +405,11 @@ static void *mmap(
     "sysgo:"
       /*"break\n"*/  /* debug only */
         "\tsyscall\n"
-    "sysret:"
-        "\tbnez $7,sysbad\n"  /* $7 === a3 */
-        "\tjr $31\n"
-    "sysbad:"
-        "\tli $2,-1\n"  /* $2 === v0; overwrite 'errno' */
-        "\tjr $31"
+    "sysret: .set noat\n"
+        "\tsltiu $1,$7,1\n"   /* 1: no error;  0: error; $7 == a3 */
+        "\taddiu $1,$1,-1\n"  /* 0: no error; -1: error */
+        "\tor $2,$2,$1\n"     /* $2 == v0; good result, else -1 for error */
+        ".set at\n"
     : "+r"(v0), "+r"(a3)  /* "+r" ==> both read and write */
     :  "r"(a0), "r"(a1), "r"(a2),      "r"(t0), "r"(t1)
     );
@@ -425,11 +426,12 @@ static ssize_t read(int fd, void *buf, size_t len)
         "bal sysgo"
     : "+r"(v0)
     : "r"(a0), "r"(a1), "r"(a2)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
 
+#if 0  //{ UNUSED
 static void *brk(void *addr)
 {
 #define __NR_brk (45+ 4000)
@@ -439,10 +441,11 @@ static void *brk(void *addr)
         "bal sysgo"
     : "+r"(v0)
     : "r"(a0)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
+#endif  //}
 
 static int close(int fd)
 {
@@ -453,7 +456,7 @@ static int close(int fd)
         "bal sysgo"
     : "+r"(v0)
     : "r"(a0)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
@@ -468,27 +471,27 @@ static void exit(int code)
         "bal sysgo"
     :
     : "r"(v0), "r"(a0)
-    : "a3"
+    : "a3", "ra"
     );
     for (;;) {}
 }
 
-#if 0  /*{ UNUSED */
+#if 0  //{ unused?
 static int munmap(void *addr, size_t len)
 {
 #define __NR_munmap (91+ 4000)
     register  void *const a0 asm("a0") = addr;
-    register size_t const a1 asm("a2") = len;
-    register size_t       v0 asm("v0");
+    register size_t const a1 asm("a1") = len;
+    register size_t       v0 asm("v0") = __NR_munmap;
     __asm__ __volatile__(
         "bal sysgo"
-    :      "=r"(v0)
-    :  [v0] "r"(__NR_munmap), "r"(a0), "r"(a1)
-    : "a3"
+    : "+r"(v0)
+    : "r"(a0), "r"(a1)
+    : "a3", "ra"
     );
     return v0;
 }
-#endif  /*}*/
+#endif  //}
 
 static int mprotect(void const *addr, size_t len, int prot)
 {
@@ -501,7 +504,7 @@ static int mprotect(void const *addr, size_t len, int prot)
         "bal sysgo"
     : "+r"(v0)
     : "r"(a0), "r"(a1), "r"(a2)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
@@ -517,7 +520,7 @@ static ssize_t open(char const *path, int kind, int mode)
         "bal sysgo"
     : "+r"(v0)
     : "r"(a0), "r"(a1), "r"(a2)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
@@ -531,10 +534,10 @@ static ssize_t write(int fd, void const *buf, size_t len)
     register size_t       const a2 asm("a2") = len;
     register size_t             v0 asm("v0") = __NR_write;
     __asm__ __volatile__(
-        "b sysgo"
+        "bal sysgo"
     : "+r"(v0)
     : "r"(a0), "r"(a1), "r"(a2)
-    : "a3"
+    : "a3", "ra"
     );
     return v0;
 }
@@ -545,15 +548,20 @@ static ssize_t write(int fd, void const *buf, size_t len)
 void *brk(void *);
 int close(int);
 void exit(int) __attribute__((__noreturn__,__nothrow__));
-void *mmap(void *, size_t, int, int, int, off_t);
+int ftruncate(int fd, size_t len);
+off_t lseek(int fd, off_t offset, int whence);
+int memfd_create(char const *, unsigned);
 int munmap(void *, size_t);
 int mprotect(void const *, size_t, int);
 int open(char const *, unsigned, unsigned);
+int openat(int fd, char const *, unsigned, unsigned);
 ssize_t read(int, void *, size_t);
+int unlink(char const *);
 ssize_t write(int, void const *, size_t);
 
 #endif  /*}*/
 void __clear_cache(void *, void *);
+void *mmap(void *, size_t, int, int, int, off_t);
 
 
 /*************************************************************************
